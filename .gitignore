@@ -1,0 +1,29 @@
+# 缓存和编译文件
+__pycache__/
+*.pyc
+
+# 编辑器
+.vscode/
+.idea/
+
+# 日志和训练输出
+logs/
+wandb/
+runs/
+videos/
+
+# 模型文件
+models/
+
+# 数据文件
+*.pkl
+*.pt
+*.pth
+*.ckpt
+
+# 子仓库
+humanoid-bench/
+src/humanoid-bench/
+
+# 其他
+.DS_Store
