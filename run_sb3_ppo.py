@@ -22,6 +22,7 @@ import torch as th
 from collections import deque
 
 from utils.wrappers import DoorCurriculumWrapper, ActionSmoothnessWrapper, ControlCostWrapper
+from utils.inverted_curriculum import InvertedDoorCurriculumWrapper
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--env_name", type=str)
@@ -33,6 +34,10 @@ parser.add_argument("--max_steps", default=20000000, type=int)
 parser.add_argument("--eval_freq", default=100000, type=int)
 parser.add_argument("--n_eval_episodes", default=10, type=int)
 parser.add_argument("--load_pretrained", action="store_true")
+parser.add_argument("--inverted", action="store_true",
+                    help="Use inverted curriculum (InvertedDoorCurriculumWrapper) instead of forward curriculum")
+parser.add_argument("--initial_tau", type=float, default=0.0,
+                    help="Initial tau for inverted curriculum (0=easy, 1=full task)")
 parser.add_argument("--wandb_entity", default="wlx-k-s-2003-ucl", type=str)
 ARGS = parser.parse_args()
 
@@ -48,15 +53,18 @@ def make_env(
     """
 
     def _init():
-        
+
         env = gym.make(ARGS.env_name)
         # env = ControlCostWrapper(env, penalty_coef=0.02, force_margin=5.0)
         # env = ActionSmoothnessWrapper(env, penalty_coef=0.001)
-        env = DoorCurriculumWrapper(env, stage=1)
+        if ARGS.inverted:
+            env = InvertedDoorCurriculumWrapper(env, initial_tau=ARGS.initial_tau)
+        else:
+            env = DoorCurriculumWrapper(env, stage=1)
         env = TimeLimit(env, max_episode_steps=1000)
         env = Monitor(env, f"logs/{ARGS.env_name}/{ARGS.exp_name}/train/env_{rank}")
         env.reset(seed=ARGS.seed + rank)
-        
+
         return env
 
     return _init
@@ -259,7 +267,7 @@ class CurriculumLogCallback(BaseCallback):
                 self.episode_metrics["robot_x"].append(info["robot_x"])
             if self.locals['dones'][idx]:
                 # episode 结束时，记录平均值
-                wandb.log({
+                log_dict = {
                     "curriculum/stage": info.get("curriculum_stage", 0),
                     "curriculum/avg_hand_distance": np.mean(self.episode_metrics["hand_distances"]),
                     "curriculum/avg_hatch_angle": np.mean(self.episode_metrics["hatch_angles"]),
@@ -267,7 +275,13 @@ class CurriculumLogCallback(BaseCallback):
                     "curriculum/max_robot_x": np.max(self.episode_metrics["robot_x"]),
                     "curriculum/distance_from_door": np.mean(self.episode_metrics["distance_from_door"]),
                     "curriculum/hand_hooking_rate": np.mean(self.episode_metrics["hand_hooking"]),
-                })
+                }
+                # 逆向课程：额外记录 tau 和滑窗成功率
+                if "inverted_tau" in info:
+                    log_dict["curriculum/inverted_tau"] = info["inverted_tau"]
+                if "inverted_success_rate" in info:
+                    log_dict["curriculum/inverted_success_rate"] = info["inverted_success_rate"]
+                wandb.log(log_dict)
                 # 清空缓存
                 self.episode_metrics = {k: [] for k in self.episode_metrics}
         
@@ -317,17 +331,22 @@ def main(argv):
             "models/h1hand-door-v0/curriculum-v6.3/best_model.zip",
             tensorboard_log=f"runs/baseline_{ARGS.env_name}_{ARGS.exp_name}"
         )
-        
+
         # env = VecNormalize.load("models/h1hand-door-v0/curriculum-v6.3/best_vecnormalize.pkl", env)
         env = VecNormalize.load("models/h1hand-door-v0/curriculum-v6.3/best_vecnormalize.pkl", env.venv)
         env.training = True
-        
+
         eval_env.obs_rms = env.obs_rms
         eval_env.ret_rms = env.ret_rms
         eval_env.training  = False
-        
-        env.env_method("set_stage", 4) 
-        eval_env.env_method("set_stage", 4)
+
+        if ARGS.inverted:
+            # 逆向课程模式：训练环境用指定的 tau，评估环境用 tau=1.0（完整任务）
+            env.env_method("set_tau", ARGS.initial_tau)
+            eval_env.env_method("set_tau", 1.0)
+        else:
+            env.env_method("set_stage", 4)
+            eval_env.env_method("set_stage", 4)
         model.set_env(env)
 
     best_model_callback = CustomEvalCallback(
