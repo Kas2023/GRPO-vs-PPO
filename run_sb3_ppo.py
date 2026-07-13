@@ -23,6 +23,7 @@ from collections import deque
 
 from utils.wrappers import DoorCurriculumWrapper, ActionSmoothnessWrapper, ControlCostWrapper
 from utils.inverted_curriculum import InvertedDoorCurriculumWrapper
+from utils.door_freeze_curriculum import DoorFreezeCurriculumWrapper
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--env_name", type=str)
@@ -38,6 +39,10 @@ parser.add_argument("--inverted", action="store_true",
                     help="Use inverted curriculum (InvertedDoorCurriculumWrapper) instead of forward curriculum")
 parser.add_argument("--initial_tau", type=float, default=0.0,
                     help="Initial tau for inverted curriculum (0=easy, 1=full task)")
+parser.add_argument("--freeze_curriculum", action="store_true",
+                    help="Use door freeze curriculum (DoorFreezeCurriculumWrapper) instead of forward curriculum")
+parser.add_argument("--initial_stage", type=int, default=0,
+                    help="Initial stage for freeze curriculum (0-4)")
 parser.add_argument("--wandb_entity", default="wlx-k-s-2003-ucl", type=str)
 ARGS = parser.parse_args()
 
@@ -57,7 +62,9 @@ def make_env(
         env = gym.make(ARGS.env_name)
         # env = ControlCostWrapper(env, penalty_coef=0.02, force_margin=5.0)
         # env = ActionSmoothnessWrapper(env, penalty_coef=0.001)
-        if ARGS.inverted:
+        if ARGS.freeze_curriculum:
+            env = DoorFreezeCurriculumWrapper(env, stage=ARGS.initial_stage)
+        elif ARGS.inverted:
             env = InvertedDoorCurriculumWrapper(env, initial_tau=ARGS.initial_tau)
         else:
             env = DoorCurriculumWrapper(env, stage=1)
@@ -281,6 +288,13 @@ class CurriculumLogCallback(BaseCallback):
                     log_dict["curriculum/inverted_tau"] = info["inverted_tau"]
                 if "inverted_success_rate" in info:
                     log_dict["curriculum/inverted_success_rate"] = info["inverted_success_rate"]
+                # 冻结课程：额外记录 stage 和滑窗成功率
+                if "freeze_stage" in info:
+                    log_dict["curriculum/freeze_stage"] = info["freeze_stage"]
+                if "freeze_success_rate" in info:
+                    log_dict["curriculum/freeze_success_rate"] = info["freeze_success_rate"]
+                if "freeze_triggered" in info:
+                    log_dict["curriculum/freeze_triggered"] = info["freeze_triggered"]
                 wandb.log(log_dict)
                 # 清空缓存
                 self.episode_metrics = {k: [] for k in self.episode_metrics}
@@ -328,19 +342,23 @@ def main(argv):
 
     if ARGS.load_pretrained:
         model = PPO.load(
-            "models/h1hand-door-v0/curriculum-v6.3/best_model.zip",
+            "models/h1hand-door-v0/curriculum-v7.1/best_model.zip",
             tensorboard_log=f"runs/baseline_{ARGS.env_name}_{ARGS.exp_name}"
         )
 
         # env = VecNormalize.load("models/h1hand-door-v0/curriculum-v6.3/best_vecnormalize.pkl", env)
-        env = VecNormalize.load("models/h1hand-door-v0/curriculum-v6.3/best_vecnormalize.pkl", env.venv)
+        env = VecNormalize.load("models/h1hand-door-v0/curriculum-v7.1/best_vecnormalize.pkl", env.venv)
         env.training = True
 
         eval_env.obs_rms = env.obs_rms
         eval_env.ret_rms = env.ret_rms
         eval_env.training  = False
 
-        if ARGS.inverted:
+        if ARGS.freeze_curriculum:
+            # 冻结课程模式：训练环境用指定的 stage，评估环境用 stage=4（完整任务）
+            env.env_method("set_stage", ARGS.initial_stage)
+            eval_env.env_method("set_stage", 4)
+        elif ARGS.inverted:
             # 逆向课程模式：训练环境用指定的 tau，评估环境用 tau=1.0（完整任务）
             env.env_method("set_tau", ARGS.initial_tau)
             eval_env.env_method("set_tau", 1.0)

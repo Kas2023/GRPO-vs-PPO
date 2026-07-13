@@ -86,24 +86,21 @@ class GRPO(PPO):
         step_dones = np.zeros((n_rollout_steps, env.num_envs), dtype=bool)
         
         for step in range(n_rollout_steps):
-            if callback.on_step() is False:
-                return False
-            
             # Sample action from policy
             with th.no_grad():
                 obs_tensor = th.as_tensor(self._last_obs).to(self.device)
                 actions, values, log_probs = self.policy(obs_tensor)
-            
+
             actions_np = actions.cpu().numpy()
-            
+
             # Step environment
             new_obs, rewards, dones, infos = env.step(actions_np)
             self.num_timesteps += env.num_envs
-            
+
             # Store rewards and dones for return calculation
             step_rewards[step] = rewards.copy()
             step_dones[step] = dones.copy()
-            
+
             # Add to buffer (rewards will be overwritten later)
             rollout_buffer.add(
                 self._last_obs,
@@ -113,9 +110,18 @@ class GRPO(PPO):
                 values,
                 log_probs,
             )
-            
+
             self._last_obs = new_obs
             self._last_episode_starts = dones
+
+            # Populate ep_info_buffer so rollout/ep_rew_mean etc. work
+            self._update_info_buffer(infos, dones)
+
+            # Give access to local variables (must be after env.step()
+            # so that 'infos', 'rewards', 'dones' etc. are in scope)
+            callback.update_locals(locals())
+            if callback.on_step() is False:
+                return False
         
         # Compute discounted returns for each step
         # Returns are computed backwards to handle episode boundaries correctly
@@ -150,7 +156,8 @@ class GRPO(PPO):
         # Store into rollout buffer
         rollout_buffer.advantages = advantages.copy()
         rollout_buffer.returns = returns.copy()
-                
+
+        callback.update_locals(locals())
         callback.on_rollout_end()
         return True
     

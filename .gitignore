@@ -11,6 +11,7 @@ logs/
 wandb/
 runs/
 videos/
+docs/
 
 # 模型文件
 models/
