@@ -53,6 +53,8 @@ parser.add_argument("--eval_freq", default=100_000, type=int)
 parser.add_argument("--n_eval_episodes", default=10, type=int)
 parser.add_argument("--pretrained_path", type=str,
                     default="models/h1hand-door-v0/curriculum-v7.1")
+parser.add_argument("--phase2", action="store_true",
+                    help="Phase 2: Oracle eval — replace env reward with binary GT success during evaluation")
 parser.add_argument("--wandb_entity", default="wlx-k-s-2003-ucl", type=str)
 ARGS = parser.parse_args()
 
@@ -62,11 +64,14 @@ ARGS = parser.parse_args()
 # ────────────────────────────────────────────────────────────────────────────
 
 class EvalMetricsWrapper(gym.Wrapper):
-    """Thin wrapper — reads physical metrics and tracks success/action smoothness.
-       Does NOT modify the environment reward."""
+    """Tracks success & action smoothness.  Optionally replaces the reward with
+    a binary oracle signal during evaluation (Phase 2)."""
 
-    def __init__(self, env):
+    def __init__(self, env, oracle_reward: bool = False,
+                 oracle_x_threshold: float | None = None):
         super().__init__(env)
+        self.oracle_reward = oracle_reward
+        self.oracle_x_threshold = oracle_x_threshold  # None → use _episode_success
         self._episode_success = False
         self._prev_action = None
         self._episode_action_sqdiff = 0.0
@@ -102,8 +107,8 @@ class EvalMetricsWrapper(gym.Wrapper):
 
         m = self._get_metrics()
 
-        # success tracking
-        if m["door_openness"] > 0.4 and m["robot_x"] > m["door_x"]:
+        # success tracking (ground-truth: robot past door-frame)
+        if m["robot_x"] > 0.8:
             self._episode_success = True
 
         # action smoothness (cumulative ||a_t - a_{t-1}||^2)
@@ -112,6 +117,19 @@ class EvalMetricsWrapper(gym.Wrapper):
                 np.sum(np.square(action - self._prev_action))
             )
         self._prev_action = action.copy()
+
+        # Phase 2: replace reward with sparse binary oracle
+        if self.oracle_reward:
+            # Determine oracle condition (separate from eval success tracking)
+            if self.oracle_x_threshold is not None:
+                oracle_success = m["robot_x"] > self.oracle_x_threshold
+            else:
+                oracle_success = self._episode_success
+            # extremely sparse: 1 at terminal step if oracle condition met, else 0
+            if terminated or truncated:
+                reward = 1.0 if oracle_success else 0.0
+            else:
+                reward = 0.0
 
         # report at episode end
         if terminated or truncated:
@@ -126,10 +144,12 @@ class EvalMetricsWrapper(gym.Wrapper):
 # Environment factory
 # ────────────────────────────────────────────────────────────────────────────
 
-def make_env(rank, seed=0):
+def make_env(rank, seed=0, oracle_reward: bool = False,
+             oracle_x_threshold: float | None = None):
     def _init():
         env = gym.make(ARGS.env_name)
-        env = EvalMetricsWrapper(env)
+        env = EvalMetricsWrapper(env, oracle_reward=oracle_reward,
+                                 oracle_x_threshold=oracle_x_threshold)
         env = TimeLimit(env, max_episode_steps=1000)
         env = Monitor(env, f"logs/{ARGS.env_name}/{ARGS.exp_name}/train/env_{rank}")
         env.reset(seed=ARGS.seed + rank)
@@ -182,30 +202,31 @@ class EpisodeLogCallback(BaseCallback):
 
 
 class EvalBestModelHandler(BaseCallback):
-    """Save VecNormalize stats when a new best eval model is found."""
+    """Sync VecNormalize stats to eval env when a new best eval model is found."""
 
-    def __init__(self, eval_env, save_path):
+    def __init__(self, eval_env):
         super().__init__()
         self.eval_env = eval_env
-        self.save_path = save_path
 
     def _on_step(self) -> bool:
         train_env = self.model.get_vec_normalize_env()
         if train_env is not None:
-            train_env.save(self.save_path)
             self.eval_env.obs_rms = train_env.obs_rms
             self.eval_env.ret_rms = train_env.ret_rms
         return True
 
 
 class PeriodicEvalCallback(EvalCallback):
-    """EvalCallback that uses success rate as the best-model criterion,
-    saves snapshots at every eval checkpoint, and logs eval/success_rate."""
+    """EvalCallback that:
+    - Uses **dual criterion** for best-model: best-by-success + best-by-reward
+    - Saves periodic snapshots at every eval checkpoint
+    """
 
     def __init__(self, model_save_dir: str, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.model_save_dir = model_save_dir
         self.best_eval_success_rate = -1.0
+        self.best_eval_mean_reward = -float("inf")
 
     def _on_step(self) -> bool:
         if self.eval_freq <= 0 or self.n_calls % self.eval_freq != 0:
@@ -219,7 +240,7 @@ class PeriodicEvalCallback(EvalCallback):
 
         # ── Run evaluation with success tracking ──
         n_episodes = self.n_eval_episodes
-        episode_rewards = []
+        episode_rewards = []       # reward the agent sees (oracle in phase2)
         episode_successes = []
         episode_lengths = []
 
@@ -247,6 +268,7 @@ class PeriodicEvalCallback(EvalCallback):
         std_reward = float(np.std(episode_rewards))
         success_rate = float(np.mean(episode_successes))
         mean_length = float(np.mean(episode_lengths))
+        criterion_reward = mean_reward  # best-by-reward uses the reward signal the agent sees
 
         # ── Log ──
         self.logger.record("eval/mean_reward", mean_reward)
@@ -273,15 +295,23 @@ class PeriodicEvalCallback(EvalCallback):
             mean_length=mean_length,
         ))
 
-        # ── Best model by success rate ──
+        # ── Dual-criterion best model ──
+        new_best = False
+
+        # Criterion 1: best by success rate
         if success_rate >= self.best_eval_success_rate:
             self.best_eval_success_rate = success_rate
-            if self.best_model_save_path is not None:
-                os.makedirs(self.best_model_save_path, exist_ok=True)
-                self.model.save(os.path.join(self.best_model_save_path, "best_model.zip"))
-                if train_vec_norm is not None:
-                    train_vec_norm.save(os.path.join(self.best_model_save_path, "best_vecnormalize.pkl"))
-            # Trigger on_new_best callbacks
+            self._save_best("best_by_success", train_vec_norm)
+            new_best = True
+
+        # Criterion 2: best by (original) mean reward
+        if criterion_reward >= self.best_eval_mean_reward:
+            self.best_eval_mean_reward = criterion_reward
+            self._save_best("best_by_reward", train_vec_norm)
+            new_best = True
+
+        # Trigger on_new_best callbacks (VecNormalize sync etc.)
+        if new_best and self.best_model_save_path is not None:
             cbs = self.callback_on_new_best
             if cbs is not None:
                 for cb in (cbs if isinstance(cbs, (list, tuple)) else [cbs]):
@@ -296,6 +326,15 @@ class PeriodicEvalCallback(EvalCallback):
 
         return True
 
+    def _save_best(self, tag: str, train_vec_norm):
+        """Save model + vecnormalize under a given tag prefix."""
+        if self.best_model_save_path is None:
+            return
+        os.makedirs(self.best_model_save_path, exist_ok=True)
+        self.model.save(os.path.join(self.best_model_save_path, f"{tag}.zip"))
+        if train_vec_norm is not None:
+            train_vec_norm.save(os.path.join(self.best_model_save_path, f"{tag}_vecnormalize.pkl"))
+
 
 # ────────────────────────────────────────────────────────────────────────────
 # Main
@@ -303,7 +342,13 @@ class PeriodicEvalCallback(EvalCallback):
 
 def main():
     # ── Training env ──
-    env = SubprocVecEnv([make_env(i) for i in range(ARGS.num_envs)])
+    # Phase 2: train with sparse oracle reward (robot_x > 0.8)
+    train_oracle = ARGS.phase2
+    train_x_threshold = 0.8 if ARGS.phase2 else None
+    env = SubprocVecEnv([
+        make_env(i, oracle_reward=train_oracle, oracle_x_threshold=train_x_threshold)
+        for i in range(ARGS.num_envs)
+    ])
     env = VecNormalize(env, norm_obs=True, norm_reward=True, clip_obs=10.0)
 
     # ── Eval env ──
@@ -311,7 +356,7 @@ def main():
     model_save_path = f"models/{ARGS.env_name}/{ARGS.exp_name}"
     os.makedirs(model_save_path, exist_ok=True)
 
-    eval_env = DummyVecEnv([make_env(EVAL_SEED_OFFSET)])
+    eval_env = DummyVecEnv([make_env(EVAL_SEED_OFFSET, oracle_reward=ARGS.phase2)])
     eval_env = VecNormalize(eval_env, norm_obs=True, norm_reward=False, clip_obs=10.0, training=False)
 
     # ── Load pretrained model + VecNormalize stats ──
@@ -347,7 +392,6 @@ def main():
         best_model_save_path=model_save_path,
         callback_on_new_best=EvalBestModelHandler(
             eval_env=eval_env,
-            save_path=os.path.join(model_save_path, "best_vecnormalize.pkl"),
         ),
         log_path=f"logs/{ARGS.env_name}/{ARGS.exp_name}/eval",
         eval_freq=ARGS.eval_freq // ARGS.num_envs,
@@ -361,7 +405,8 @@ def main():
         entity=ARGS.wandb_entity,
         project="humanoid-bench",
         name=f"{ARGS.exp_name}",
-        tags=[f"algo_{ARGS.algo}", f"seed_{ARGS.seed}", "finetune_raw"],
+        tags=[f"algo_{ARGS.algo}", f"seed_{ARGS.seed}", "finetune_raw"]
+             + (["phase2"] if ARGS.phase2 else []),
         sync_tensorboard=True,
         monitor_gym=True,
         save_code=False,

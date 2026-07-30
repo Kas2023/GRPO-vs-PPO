@@ -68,7 +68,8 @@ class EvalMetricsWrapper(gym.Wrapper):
 
         m = self._get_metrics()
 
-        if m["door_openness"] > 0.4 and m["robot_x"] > m["door_x"]:
+        # if m["door_openness"] > 0.4 and m["robot_x"] > m["door_x"]:
+        if m["robot_x"] > 0.8:
             self._episode_success = True
 
         if self._prev_action is not None:
@@ -94,8 +95,8 @@ def parse_args():
     parser.add_argument("--env_name", type=str, default="h1hand-door-v0")
     parser.add_argument("--exp_name", type=str, required=True)
     parser.add_argument("--model_dir", type=str, default="models")
-    parser.add_argument("--model_file", type=str, default="best_model.zip")
-    parser.add_argument("--vecnormalize_file", type=str, default="best_vecnormalize.pkl")
+    parser.add_argument("--model_file", type=str, default="best_by_reward.zip")
+    parser.add_argument("--vecnormalize_file", type=str, default="best_by_reward_vecnormalize.pkl")
     parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "grpo"])
     parser.add_argument("--seeds", type=int, nargs="+", default=[1024, 2024, 777, 88, 13])
     parser.add_argument("--n_eval_episodes", type=int, default=20)
