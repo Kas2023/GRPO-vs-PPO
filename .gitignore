@@ -11,7 +11,7 @@ logs/
 wandb/
 runs/
 videos/
-docs/
+# docs/
 
 # 模型文件
 models/

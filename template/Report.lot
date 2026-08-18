@@ -1,0 +1,19 @@
+\babel@toc {english}{}\relax 
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\contentsline {table}{\numberline {3.1}{\ignorespaces Baseline model performance.\relax }}{10}{table.caption.8}%
+\contentsline {table}{\numberline {3.2}{\ignorespaces Training rewards and model naming.\relax }}{11}{table.caption.9}%
+\addvspace {10\p@ }
+\contentsline {table}{\numberline {4.1}{\ignorespaces Overall performance under two reward conditions. The PPO/GRPO entries report the cross-seed mean $\pm $ cross-seed std over the 3 training seeds (42, 98, 5075), each evaluated over 100 episodes; the Baseline is a single pretrained model, whose values are the mean over its 100 evaluation episodes.\relax }}{13}{table.caption.10}%
+\contentsline {table}{\numberline {4.2}{\ignorespaces Results with success-rate-based checkpoint selection. Entries are cross-seed mean $\pm $ cross-seed std over the 3 training seeds; the Baseline is a single pretrained model.\relax }}{14}{table.caption.11}%
+\contentsline {table}{\numberline {4.3}{\ignorespaces Weighted component contributions (cross-seed mean $\pm $ cross-seed std over 3 seeds).\relax }}{15}{table.caption.13}%
+\contentsline {table}{\numberline {4.4}{\ignorespaces Reward composition shares (cross-seed mean, \%).\relax }}{16}{table.caption.14}%
+\contentsline {table}{\numberline {4.5}{\ignorespaces KL divergence of each model relative to the Baseline (cross-seed mean $\pm $ cross-seed std).\relax }}{17}{table.caption.16}%
+\contentsline {table}{\numberline {4.6}{\ignorespaces VecNormalize observation-statistic drift (cross-seed mean $\pm $ cross-seed std).\relax }}{23}{table.caption.21}%
+\contentsline {table}{\numberline {4.7}{\ignorespaces KL-penalty ablation results. The GRPO+KL column reports single-seed mean values (returns, success rates, door shares) across 3 seeds.\relax }}{23}{table.caption.22}%
+\contentsline {table}{\numberline {4.8}{\ignorespaces Results on the Reach task.\relax }}{25}{table.caption.23}%
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }

@@ -19,15 +19,15 @@ Usage:
     # Phase 1 models
     python analyze_kl.py \
         --baseline_exp curriculum-v7.1 \
-        --ppo_exp ft_ppo_v2 --ppo_model best_model \
-        --grpo_exp ft_grpo_v2 --grpo_model best_model \
+        --ppo_exp ft_ppo_v2 --ppo_model best_by_reward \
+        --grpo_exp ft_grpo_v2 --grpo_model best_by_reward \
         --n_rollout_episodes 10 --n_obs 1000
 
     # Include Phase 2 models
     python analyze_kl.py \
         --baseline_exp curriculum-v7.1 \
-        --ppo_exp ft_ppo_v2 --ppo_model best_model \
-        --grpo_exp ft_grpo_v2 --grpo_model best_model \
+        --ppo_exp ft_ppo_v2 --ppo_model best_by_reward \
+        --grpo_exp ft_grpo_v2 --grpo_model best_by_reward \
         --ppo2_exp ft_ppo_v3 --ppo2_model best_by_reward \
         --grpo2_exp ft_grpo_v3 --grpo2_model best_by_reward
 """
@@ -156,10 +156,10 @@ def collect_observations(
     double-normalization issues.
 
     Returns:
-        raw_obs:      (N, obs_dim) un-normalized observations
-        baseline_mean: (obs_dim,)  baseline VecNormalize mean
-        baseline_var:  (obs_dim,)  baseline VecNormalize variance
-        baseline_eps:  float       baseline VecNormalize epsilon
+        raw_obs:   (N, obs_dim) un-normalized observations
+        obs_mean:  (obs_dim,)   baseline VecNormalize mean
+        obs_var:   (obs_dim,)   baseline VecNormalize variance
+        eps:       float        baseline VecNormalize epsilon
     """
     # Build env WITHOUT VecNormalize to get raw observations
     env = DummyVecEnv([make_collector_env(env_name)])
@@ -182,7 +182,7 @@ def collect_observations(
     all_raw_obs = []
 
     for ep in range(n_episodes):
-        env.venv.envs[0].reset(seed=base_seed + ep)
+        env.envs[0].reset(seed=base_seed + ep)
         raw_obs = env.reset()  # (1, obs_dim) — raw, not normalized
         done = False
 
@@ -251,11 +251,11 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python analyze_kl.py \\
-      --baseline_exp curriculum-v7.1 \\
-      --ppo_exp ft_ppo_v2 --ppo_model best_model \\
-      --grpo_exp ft_grpo_v2 --grpo_model best_model \\
-      --n_rollout_episodes 10
+python analyze_kl.py \
+    --baseline_exp curriculum-v7.1 \
+    --ppo_exp ft_ppo_v2_5075 --ppo_model best_by_reward \
+    --grpo_exp ft_grpokl_5075 --grpo_model best_by_reward \
+    --n_rollout_episodes 10
         """,
     )
     parser.add_argument("--env_name", type=str, default="h1hand-door-v0")
@@ -314,11 +314,17 @@ def resolve_model_path(model_dir, env_name, exp_name, model_tag):
 
 
 def resolve_vecnorm_path(model_dir, env_name, exp_name, model_tag):
+    """Resolve VecNormalize path. Tries {model_tag}_vecnormalize.pkl first,
+    then best_vecnormalize.pkl as fallback (for v2 models)."""
     vn_path = os.path.join(model_dir, env_name, exp_name,
                            f"{model_tag}_vecnormalize.pkl")
-    if not os.path.exists(vn_path):
-        return None
-    return vn_path
+    if os.path.exists(vn_path):
+        return vn_path
+    # Fallback: some older experiments use this naming
+    fallback = os.path.join(model_dir, env_name, exp_name, "best_vecnormalize.pkl")
+    if os.path.exists(fallback):
+        return fallback
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -373,7 +379,7 @@ def main():
         baseline_spec["model_path"],
         args.env_name,
     )
-    raw_obs, baseline_mean, baseline_var, baseline_eps = collect_observations(
+    raw_obs, baseline_obs_mean, baseline_obs_var, baseline_obs_eps = collect_observations(
         model=collector,
         env_name=args.env_name,
         vecnormalize_path=baseline_spec["vecnorm_path"],
@@ -392,7 +398,7 @@ def main():
           f"(obs_dim={raw_obs.shape[1]})")
 
     # Also save baseline-normalized observations for reference
-    baseline_obs_norm = (raw_obs - baseline_mean) / np.sqrt(baseline_var + baseline_eps)
+    baseline_obs_norm = (raw_obs - baseline_obs_mean) / np.sqrt(baseline_obs_var + baseline_obs_eps)
 
     # ── Step 2: Load all models, normalize with each model's own stats ──
     print("\n[2/4] Loading models and extracting policy distributions ...")
@@ -431,8 +437,8 @@ def main():
         del model
         print(f"done (mean shape: {stats['mean'].shape})")
 
-    baseline_mean = policy_stats["Baseline"]["mean"]
-    baseline_log_std = policy_stats["Baseline"]["log_std"]
+    baseline_act_mean = policy_stats["Baseline"]["mean"]
+    baseline_act_log_std = policy_stats["Baseline"]["log_std"]
 
     # ── Step 3: Compute KL divergences ──
     print("\n[3/4] Computing KL divergences and action differences ...\n")
@@ -450,7 +456,7 @@ def main():
         log_std_p = policy_stats[label]["log_std"]
 
         # KL(Finetuned || Baseline)
-        kl_per_obs = gaussian_kl(mean_p, log_std_p, baseline_mean, baseline_log_std)
+        kl_per_obs = gaussian_kl(mean_p, log_std_p, baseline_act_mean, baseline_act_log_std)
 
         kl_results[label] = {
             "mean": float(np.mean(kl_per_obs)),
@@ -463,7 +469,7 @@ def main():
         }
 
         # ||μ_finetune - μ_baseline|| per observation
-        action_diff = np.linalg.norm(mean_p - baseline_mean, axis=-1)
+        action_diff = np.linalg.norm(mean_p - baseline_act_mean, axis=-1)
         action_diff_results[label] = {
             "mean": float(np.mean(action_diff)),
             "median": float(np.median(action_diff)),
@@ -474,7 +480,7 @@ def main():
         }
 
         # Log-std shift per dimension
-        delta_log_std = log_std_p - baseline_log_std
+        delta_log_std = log_std_p - baseline_act_log_std
         log_std_results[label] = {
             "per_dim": delta_log_std.tolist(),
             "mean_delta": float(np.mean(delta_log_std)),
@@ -605,8 +611,8 @@ def main():
                 DummyVecEnv([make_collector_env(args.env_name)]),
             )
             vn.training = False
-            mean_diff = np.linalg.norm(vn.obs_rms.mean - baseline_mean)
-            var_diff = np.linalg.norm(vn.obs_rms.var - baseline_var)
+            mean_diff = np.linalg.norm(vn.obs_rms.mean - baseline_obs_mean)
+            var_diff = np.linalg.norm(vn.obs_rms.var - baseline_obs_var)
             print(f"    {label:<12s} ||Δ mean||={mean_diff:.4f}  ||Δ var||={var_diff:.4f}")
 
     # Determine the key comparison pair (Phase 1 PPO vs GRPO)

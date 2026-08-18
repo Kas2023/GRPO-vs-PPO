@@ -1,0 +1,15 @@
+\babel@toc {english}{}\relax 
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\contentsline {figure}{\numberline {4.1}{\ignorespaces Stacked-bar reward decomposition of each model on the Door task; the bar height is the accumulated value of each weighted component. Orange: door openness; blue: passing the door; grey: the remaining components.\relax }}{16}{figure.caption.12}%
+\contentsline {figure}{\numberline {4.2}{\ignorespaces Action-distribution KL divergence of each model relative to the Baseline, over 3 seeds; the bar height is the cross-seed mean and the dots are individual seeds.\relax }}{18}{figure.caption.15}%
+\contentsline {figure}{\numberline {4.3}{\ignorespaces Scatter plot of KL divergence versus return, two panels, left = Misaligned Reward condition, right = Sparse Reward condition; the dashed line is the baseline reference.\relax }}{19}{figure.caption.17}%
+\contentsline {figure}{\numberline {4.4}{\ignorespaces L2 distance of each model's deterministic action mean relative to the Baseline, cross-seed mean, with dots for individual seeds.\relax }}{20}{figure.caption.18}%
+\contentsline {figure}{\numberline {4.5}{\ignorespaces Average log-$\sigma $ shift of each model relative to the Baseline, cross-seed mean, with dots for individual seeds.\relax }}{21}{figure.caption.19}%
+\contentsline {figure}{\numberline {4.6}{\ignorespaces Parameter-space L2 distance of each model relative to the Baseline, cross-seed mean, with dots for individual seeds.\relax }}{22}{figure.caption.20}%
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }
+\addvspace {10\p@ }

@@ -1,33 +1,41 @@
 """
 Multi-seed evaluation on the HumanoidBench Reach task (h1hand-reach-v0).
 
-Loads a fine-tuned SB3 model (PPO/GRPO) or the raw pretrained reach model
-(torch_model.pt) and evaluates across multiple seeds.  Reports the same
-metrics as eval.py plus reach-specific ones.
+Supports two modes:
+  --mode expanded (default): Full 155D obs, 61D action, with offset-centering.
+        Used for finetune_reach.py models and for evaluating the baseline
+        with the expanded architecture.
+  --mode wrapper (legacy): 55D obs, 19D action via ReachObsWrapper +
+        ReachActWrapper.  Used for the original pretrained model without
+        dimension expansion.
 
 Metrics:
     - Success rate       : hand_dist < 0.05 m at any point in the episode
     - Mean return        : cumulative reward
     - Episode length
-    - Action smoothness  : cumulative ||a_t - a_{t-1}||^2 on body actions
+    - Action smoothness  : cumulative ||a_t - a_{t-1}||^2
     - Min hand distance  : closest the left hand got to the target
 
 Usage:
-    # Evaluate a fine-tuned model
+    # Evaluate a finetune_reach model (expanded mode)
     python eval_reach.py \\
-        --exp_name reach_grpo \\
+        --exp_name reach_sparse_grpo \\
         --model_file best_by_success.zip \\
         --vecnormalize_file best_by_success_vecnormalize.pkl \\
         --algo grpo \\
-        --seeds 42 2024 777 88 13 \\
-        --n_eval_episodes 20
+        --seeds 42 1024 2024 777 88 13
 
-    # Evaluate the raw pretrained reach model (baseline)
+    # Evaluate baseline with expanded architecture
     python eval_reach.py \\
-        --exp_name baseline \\
+        --exp_name baseline_expanded \\
         --baseline \\
-        --seeds 42 2024 777 88 13 \\
-        --n_eval_episodes 20
+        --seeds 42 1024 2024 777 88 13
+
+    # Evaluate baseline with original wrappers (55D/19D)
+    python eval_reach.py \\
+        --exp_name baseline_wrapper \\
+        --baseline --mode wrapper \\
+        --seeds 42 1024 2024 777 88 13
 """
 
 import argparse
@@ -40,6 +48,8 @@ from gymnasium.spaces import Box
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.running_mean_std import RunningMeanStd
 
 import mujoco
 import humanoid_bench
@@ -48,12 +58,197 @@ from humanoid_bench.wrappers import get_body_idxs
 from utils.grpo import GRPO
 
 # ──────────────────────────────────────────────────────────────────────
-# Observation wrapper (same as test_reach.py)
+# Shared paths
 # ──────────────────────────────────────────────────────────────────────
+REACH_MODEL_DIR = "humanoid-bench/data/reach_one_hand"
+REACH_MODEL_PATH = os.path.join(REACH_MODEL_DIR, "torch_model.pt")
+REACH_MEAN_PATH = os.path.join(REACH_MODEL_DIR, "mean.npy")
+REACH_VAR_PATH = os.path.join(REACH_MODEL_DIR, "var.npy")
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODE 1: expanded — full 155D obs, 61D action, offset-centering only
+# ══════════════════════════════════════════════════════════════════════
+
+class ReachEvalWrapper(gym.Wrapper):
+    """Centers the observation (same offset logic as SingleReachWrapper)
+    and tracks per-episode metrics.  Does NOT override the reward —
+    the original dense reward is preserved for evaluation.
+
+    Output: 155D centered observation, 61D action.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        self._task = env.unwrapped.task
+        model = env.unwrapped.model
+        self._body_idxs, self._body_vel_idxs = get_body_idxs(model)
+        self._robot_dof = env.unwrapped.robot.dof
+
+        self._episode_success = False
+        self._prev_action = None
+        self._episode_action_sqdiff = 0.0
+        self._min_hand_dist = float("inf")
+
+    def _center_obs(self, obs: np.ndarray) -> np.ndarray:
+        robot_dof = self._robot_dof
+        position = obs[:robot_dof].copy()
+        velocity = obs[robot_dof:robot_dof * 2 - 1]
+        left_hand = obs[robot_dof * 2 - 1:robot_dof * 2 + 2].copy()
+        target = obs[robot_dof * 2 + 2:].copy()
+
+        body_pos = position[self._body_idxs]
+        offset = np.array([body_pos[0], body_pos[1], 0.0])
+        body_pos[:3] -= offset
+        position[self._body_idxs] = body_pos
+        left_hand -= offset
+        target -= offset
+
+        return np.concatenate([position, velocity, left_hand, target])
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._episode_success = False
+        self._prev_action = None
+        self._episode_action_sqdiff = 0.0
+        self._min_hand_dist = float("inf")
+        return self._center_obs(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+
+        hand_dist = float(np.sqrt(
+            np.square(self._task.robot.left_hand_position() - self._task.goal).sum()
+        ))
+
+        if hand_dist < self._min_hand_dist:
+            self._min_hand_dist = hand_dist
+        if hand_dist < 0.05:
+            self._episode_success = True
+
+        if self._prev_action is not None:
+            self._episode_action_sqdiff += float(
+                np.sum(np.square(action - self._prev_action))
+            )
+        self._prev_action = action.copy()
+
+        info["hand_dist"] = hand_dist
+
+        if terminated or truncated:
+            if self._episode_success:
+                info["success"] = 1
+            info["action_smoothness"] = self._episode_action_sqdiff
+            info["min_hand_dist"] = self._min_hand_dist
+
+        return self._center_obs(obs), reward, terminated, truncated, info
+
+
+def make_env_expanded(seed: int = 0):
+    def _init():
+        env = gym.make("h1hand-reach-v0", render_mode="rgb_array")
+        env = ReachEvalWrapper(env)
+        # gym.make already applies TimeLimit(max_episode_steps=1000) from
+        # Task.max_episode_steps; do NOT add a second one.
+        env = Monitor(env)
+        env.reset(seed=seed)
+        return env
+    return _init
+
+
+def get_obs_mapping(env) -> list:
+    """55D → 155D index mapping (same as finetune_reach.py)."""
+    model = env.unwrapped.model
+    body_idxs, body_vel_idxs = get_body_idxs(model)
+    robot_dof = env.unwrapped.robot.dof
+
+    mapping = []
+    for idx in body_idxs[2:]:
+        mapping.append(idx)
+    for idx in body_vel_idxs:
+        mapping.append(robot_dof + idx)
+    for i in range(3):
+        mapping.append(robot_dof * 2 - 1 + i)
+    for i in range(3):
+        mapping.append(robot_dof * 2 + 2 + i)
+
+    assert len(mapping) == 55
+    return mapping
+
+
+def get_action_mapping(env) -> list:
+    """19 → 61 action index mapping (same as finetune_reach.py)."""
+    if env.unwrapped.model.nu > 19:
+        return list(range(15)) + list(range(16, 20))
+    else:
+        return list(range(19))
+
+
+def load_weights_expanded(model, pt_path, mean_path, var_path,
+                           obs_mapping, act_mapping):
+    """Load pretrained reach weights into expanded 155D→61D policy."""
+    pt_weights = th.load(pt_path, map_location="cpu")
+    policy_state = model.policy.state_dict()
+
+    full_obs = len(policy_state["mlp_extractor.policy_net.0.weight"][0])
+    full_act = len(policy_state["action_net.bias"])
+
+    # dense1: (256, 55) → (256, 155)
+    old_w1 = pt_weights["dense1.weight"]
+    new_w1 = th.zeros(256, full_obs)
+    for j, col in enumerate(obs_mapping):
+        new_w1[:, col] = old_w1[:, j]
+    policy_state["mlp_extractor.policy_net.0.weight"] = new_w1
+    policy_state["mlp_extractor.policy_net.0.bias"] = pt_weights["dense1.bias"]
+
+    # dense2: direct copy
+    policy_state["mlp_extractor.policy_net.2.weight"] = pt_weights["dense2.weight"]
+    policy_state["mlp_extractor.policy_net.2.bias"] = pt_weights["dense2.bias"]
+
+    # dense3: (19, 256) → (61, 256)
+    old_w3 = pt_weights["dense3.weight"]
+    new_w3 = th.zeros(full_act, 256)
+    for j, row in enumerate(act_mapping):
+        new_w3[row] = old_w3[j]
+    policy_state["action_net.weight"] = new_w3
+
+    old_b3 = pt_weights["dense3.bias"]
+    new_b3 = th.zeros(full_act)
+    for j, row in enumerate(act_mapping):
+        new_b3[row] = old_b3[j]
+    policy_state["action_net.bias"] = new_b3
+
+    # log_std: expand (61,) — body-joint direct copy, hand-joint default -1.0
+    old_std = policy_state["log_std"]  # freshly initialised (61,)
+    new_std = th.full((full_act,), -1.0)
+    for target_row in act_mapping:
+        new_std[target_row] = old_std[target_row]
+    policy_state["log_std"] = new_std
+
+    model.policy.load_state_dict(policy_state)
+
+    # VecNormalize: expand 55D → full
+    pt_mean = np.load(mean_path)[0].astype(np.float64)
+    pt_var = np.load(var_path)[0].astype(np.float64)
+
+    full_mean = np.zeros(full_obs, dtype=np.float64)
+    full_var = np.ones(full_obs, dtype=np.float64)
+    for j, col in enumerate(obs_mapping):
+        full_mean[col] = pt_mean[j]
+        full_var[col] = pt_var[j]
+
+    train_env = model.get_vec_normalize_env()
+    if train_env is not None:
+        train_env.obs_rms.mean = full_mean
+        train_env.obs_rms.var = full_var
+        train_env.obs_rms.count = 1e4
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MODE 2: wrapper — legacy 55D obs, 19D action (unchanged from before)
+# ══════════════════════════════════════════════════════════════════════
 
 class ReachObsWrapper(gym.ObservationWrapper):
-    """Transform full 155D reach-task observation into the 55D format
-    expected by the pretrained reach model."""
+    """Transform full 155D → 55D for the pretrained reach model."""
 
     def __init__(self, env):
         super().__init__(env)
@@ -75,19 +270,15 @@ class ReachObsWrapper(gym.ObservationWrapper):
         body_vel = velocity[self.body_vel_idxs]
 
         offset = np.array([body_pos[0], body_pos[1], 0.0])
-        body_pos[:3] = body_pos[:3] - offset
-        left_hand = left_hand - offset
-        target = target - offset
+        body_pos[:3] -= offset
+        left_hand -= offset
+        target -= offset
 
         return np.concatenate([body_pos[2:], body_vel, left_hand, target])
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Action wrapper (same as test_reach.py)
-# ──────────────────────────────────────────────────────────────────────
-
 class ReachActWrapper(gym.ActionWrapper):
-    """Expand 19D body-joint actions to 61D (body + fixed hands)."""
+    """Expand 19D body-joint actions to 61D (hands fixed at 1.57 rad)."""
 
     def __init__(self, env):
         super().__init__(env)
@@ -112,12 +303,8 @@ class ReachActWrapper(gym.ActionWrapper):
         return 2 * (full_action - env.action_low) / (env.action_high - env.action_low) - 1
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Metrics wrapper (same logic as test_reach.py)
-# ──────────────────────────────────────────────────────────────────────
-
 class ReachMetricsWrapper(gym.Wrapper):
-    """Tracks hand distance, success, and action smoothness."""
+    """Tracks hand distance, success, and action smoothness (19D body actions)."""
 
     def __init__(self, env):
         super().__init__(env)
@@ -158,28 +345,20 @@ class ReachMetricsWrapper(gym.Wrapper):
         return obs, reward, terminated, truncated, info
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Environment factory
-# ──────────────────────────────────────────────────────────────────────
-
-def make_env(seed: int = 0):
-    """Create a wrapped reach env for evaluation (no Monitor needed)."""
+def make_env_wrapper(seed: int = 0):
     def _init():
         env = gym.make("h1hand-reach-v0", render_mode="rgb_array")
         env = ReachObsWrapper(env)
         env = ReachActWrapper(env)
         env = ReachMetricsWrapper(env)
+        env = Monitor(env)
         env.reset(seed=seed)
         return env
     return _init
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Weight loading (same as test_reach.py)
-# ──────────────────────────────────────────────────────────────────────
-
-def load_reach_weights_to_policy(model, pt_path: str, mean_path: str, var_path: str):
-    """Load pretrained reach TorchModel weights into an SB3 policy."""
+def load_weights_wrapper(model, pt_path, mean_path, var_path):
+    """Load pretrained reach weights into 55D→19D policy (no expansion)."""
     pt_weights = th.load(pt_path, map_location="cpu")
     policy_state = model.policy.state_dict()
 
@@ -199,7 +378,6 @@ def load_reach_weights_to_policy(model, pt_path: str, mean_path: str, var_path: 
 
     model.policy.load_state_dict(policy_state)
 
-    # VecNormalize stats
     pt_mean = np.load(mean_path)[0].astype(np.float64)
     pt_var = np.load(var_path)[0].astype(np.float64)
     train_env = model.get_vec_normalize_env()
@@ -209,66 +387,40 @@ def load_reach_weights_to_policy(model, pt_path: str, mean_path: str, var_path: 
         train_env.obs_rms.count = 1e4
 
 
-# ──────────────────────────────────────────────────────────────────────
-# CLI
-# ──────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--exp_name", type=str, required=True,
-                        help="Experiment name (subdirectory under models/h1hand-reach-v0/)")
-    parser.add_argument("--model_dir", type=str, default="models/h1hand-reach-v0")
-    parser.add_argument("--model_file", type=str, default="best_by_success.zip")
-    parser.add_argument("--vecnormalize_file", type=str,
-                        default="best_by_success_vecnormalize.pkl")
-    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "grpo"])
-    parser.add_argument("--seeds", type=int, nargs="+",
-                        default=[42, 1024, 2024, 777, 88, 13])
-    parser.add_argument("--n_eval_episodes", type=int, default=20)
-    parser.add_argument("--baseline", action="store_true",
-                        help="Evaluate the raw pretrained reach model "
-                             "(torch_model.pt) as baseline, ignoring --exp_name "
-                             "and --model_file.")
-    parser.add_argument("--reach_model_dir", type=str,
-                        default="humanoid-bench/data/reach_one_hand",
-                        help="Path to reach_one_hand data (for --baseline)")
-    return parser.parse_args()
-
-
-# ──────────────────────────────────────────────────────────────────────
-# Single-seed evaluation
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# Evaluation runner
+# ══════════════════════════════════════════════════════════════════════
 
 def eval_single_seed(
     model,
     vecnormalize_path: str | None,
+    make_env_fn,
     obs_mean: np.ndarray | None = None,
     obs_var: np.ndarray | None = None,
     n_eval_episodes: int = 20,
     base_seed: int = 0,
 ):
-    """Run evaluation with a specific base seed.
+    """Run evaluation with a specific base seed."""
 
-    Parameters
-    ----------
-    obs_mean, obs_var : optional explicit VecNormalize stats (used in
-        baseline mode where the model's attached env differs from the
-        eval env being built here).
-    """
+    env = DummyVecEnv([make_env_fn(seed=base_seed)])
 
-    env = DummyVecEnv([make_env(seed=base_seed)])
-    env = VecNormalize(env, norm_obs=True, norm_reward=False,
-                       clip_obs=10.0, training=False)
-
-    # Load VecNormalize stats
+    # Load VecNormalize onto the raw DummyVecEnv (single layer).
+    # Wrapping a fresh VecNormalize first and then loading on top of it
+    # double-normalizes: the inner fresh layer clips raw obs to ±10
+    # BEFORE the real stats are applied, corrupting observations.
     if vecnormalize_path and os.path.exists(vecnormalize_path):
         env = VecNormalize.load(vecnormalize_path, env)
         env.training = False
         env.norm_reward = False
     elif obs_mean is not None and obs_var is not None:
+        env = VecNormalize(env, norm_obs=True, norm_reward=False,
+                           clip_obs=10.0, training=False)
         env.obs_rms.mean = obs_mean.copy()
         env.obs_rms.var = obs_var.copy()
         env.obs_rms.count = 1e4
+    else:
+        env = VecNormalize(env, norm_obs=True, norm_reward=False,
+                           clip_obs=10.0, training=False)
 
     model.set_env(env)
 
@@ -279,7 +431,6 @@ def eval_single_seed(
     episode_min_hand_dists = []
 
     for ep in range(n_eval_episodes):
-        # Re-seed the underlying gym env for independent rollouts
         env.venv.envs[0].reset(seed=base_seed + ep)
         obs = env.reset()
         done = False
@@ -327,15 +478,58 @@ def eval_single_seed(
     }
 
 
-# ──────────────────────────────────────────────────────────────────────
-# Multi-seed evaluation
-# ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════
+# CLI + main
+# ══════════════════════════════════════════════════════════════════════
 
-def eval_multi_seed(args):
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--exp_name", type=str, default="baseline",
+                        help="Experiment name (subdirectory under models/h1hand-reach-v0/)")
+    parser.add_argument("--model_dir", type=str, default="models/h1hand-reach-v0")
+    parser.add_argument("--model_file", type=str, default="best_by_success.zip")
+    parser.add_argument("--vecnormalize_file", type=str,
+                        default="best_by_success_vecnormalize.pkl")
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "grpo"])
+    parser.add_argument("--seeds", type=int, nargs="+",
+                        default=[42, 1024, 2024, 777, 88, 13])
+    parser.add_argument("--n_eval_episodes", type=int, default=20)
+    parser.add_argument("--baseline", action="store_true",
+                        help="Evaluate the raw pretrained reach model as baseline.")
+    parser.add_argument("--mode", type=str, default="expanded",
+                        choices=["expanded", "wrapper"],
+                        help="expanded = full 155D/61D with centering; "
+                             "wrapper = legacy 55D/19D with ReachObsWrapper+ReachActWrapper")
+    parser.add_argument("--reach_model_dir", type=str,
+                        default="humanoid-bench/data/reach_one_hand")
+    parser.add_argument("--device", type=str, default="cuda",
+                        choices=["cuda", "cpu"])
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
     env_name = "h1hand-reach-v0"
+    mode = args.mode
+
+    # Select make_env + weight loading based on mode
+    if mode == "expanded":
+        make_env_fn = make_env_expanded
+        load_baseline_fn = load_weights_expanded
+        mode_desc = "EXPANDED — full 155D obs, 61D act, offset-centering only"
+        dummy_env = DummyVecEnv([make_env_expanded(seed=0)])
+        dummy_env = VecNormalize(dummy_env, norm_obs=True, norm_reward=True,
+                                 clip_obs=10.0)
+    else:
+        make_env_fn = make_env_wrapper
+        load_baseline_fn = load_weights_wrapper
+        mode_desc = "WRAPPER — legacy 55D obs, 19D act (ReachObsWrapper + ReachActWrapper)"
+        dummy_env = DummyVecEnv([make_env_wrapper(seed=0)])
+        dummy_env = VecNormalize(dummy_env, norm_obs=True, norm_reward=True,
+                                 clip_obs=10.0)
 
     if args.baseline:
-        # ── Baseline mode: load raw torch_model.pt into fresh SB3 ──
+        # ── Baseline mode ──
         pt_path = os.path.join(args.reach_model_dir, "torch_model.pt")
         mean_path = os.path.join(args.reach_model_dir, "mean.npy")
         var_path = os.path.join(args.reach_model_dir, "var.npy")
@@ -346,76 +540,80 @@ def eval_multi_seed(args):
                 sys.exit(1)
 
         print("=" * 60)
-        print("BASELINE — Raw pretrained reach model (torch_model.pt)")
+        print(f"BASELINE — {mode_desc}")
         print("=" * 60)
         print(f"Reach model : {pt_path}")
-        print(f"Task        : {env_name}")
+        print(f"Mode        : {mode}")
         print(f"Seeds       : {args.seeds}")
         print(f"Episodes    : {args.n_eval_episodes} per seed")
-
-        # Create a dummy VecEnv just to initialise the model
-        dummy_env = DummyVecEnv([make_env(seed=0)])
-        dummy_env = VecNormalize(dummy_env, norm_obs=True, norm_reward=True,
-                                 clip_obs=10.0)
 
         algo_cls = {"ppo": PPO, "grpo": GRPO}[args.algo]
         model = algo_cls(
             "MlpPolicy",
             dummy_env,
             policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
-            device="cuda",
+            device=args.device,
         )
-        load_reach_weights_to_policy(model, pt_path, mean_path, var_path)
 
-        # Capture VecNormalize stats before the dummy env is discarded
+        # Load weights (with or without expansion depending on mode)
+        if mode == "expanded":
+            temp_env = gym.make("h1hand-reach-v0")
+            obs_map = get_obs_mapping(temp_env)
+            act_map = get_action_mapping(temp_env)
+            temp_env.close()
+            load_baseline_fn(model, pt_path, mean_path, var_path, obs_map, act_map)
+        else:
+            load_baseline_fn(model, pt_path, mean_path, var_path)
+
         train_norm = model.get_vec_normalize_env()
         obs_mean = train_norm.obs_rms.mean.copy()
         obs_var = train_norm.obs_rms.var.copy()
         dummy_env.close()
 
         vecnorm_path = None
-        model_path = "(raw torch_model.pt)"
 
     else:
         # ── Fine-tuned model mode ──
-        obs_mean = obs_var = None  # not used; stats come from vecnorm file
         model_path = os.path.join(args.model_dir, args.exp_name, args.model_file)
         vecnorm_path = os.path.join(args.model_dir, args.exp_name,
-                                    args.vecnormalize_file)
+                                     args.vecnormalize_file)
 
         if not os.path.exists(model_path):
             print(f"[ERROR] Model not found: {model_path}")
             sys.exit(1)
 
+        obs_mean = obs_var = None
+
         print("=" * 60)
-        print(f"Fine-tuned model: {args.exp_name}")
+        print(f"FINE-TUNED — {mode_desc}")
         print("=" * 60)
         print(f"Model       : {model_path}")
         print(f"VecNorm     : {vecnorm_path}")
         print(f"Algorithm   : {args.algo}")
-        print(f"Task        : {env_name}")
+        print(f"Mode        : {mode}")
         print(f"Seeds       : {args.seeds}")
         print(f"Episodes    : {args.n_eval_episodes} per seed")
 
         algo_cls = {"ppo": PPO, "grpo": GRPO}[args.algo]
-        # Temporary env just for loading
-        tmp_env = DummyVecEnv([make_env(seed=0)])
+        # Load model with a temporary vec env
+        tmp_env = DummyVecEnv([make_env_fn(seed=0)])
         tmp_env = VecNormalize(tmp_env, norm_obs=True, norm_reward=False,
                                clip_obs=10.0, training=False)
-        model = algo_cls.load(model_path, env=tmp_env)
+        model = algo_cls.load(model_path, env=tmp_env, device=args.device)
         tmp_env.close()
 
-        # model already has VecNormalize stats loaded
+        dummy_env.close()
 
-    # ── Run multi-seed evaluation ──
+    # ── Multi-seed evaluation ──
     print("-" * 60)
     results = []
     for seed in args.seeds:
         metrics = eval_single_seed(
             model=model,
             vecnormalize_path=vecnorm_path,
-            obs_mean=obs_mean if args.baseline else None,
-            obs_var=obs_var if args.baseline else None,
+            make_env_fn=make_env_fn,
+            obs_mean=obs_mean,
+            obs_var=obs_var,
             n_eval_episodes=args.n_eval_episodes,
             base_seed=seed,
         )
@@ -453,5 +651,4 @@ def eval_multi_seed(args):
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    eval_multi_seed(args)
+    main()

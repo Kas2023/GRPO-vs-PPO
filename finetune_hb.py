@@ -36,6 +36,7 @@ import wandb
 import humanoid_bench
 
 from utils.grpo import GRPO
+from utils.grpo_kl import GRPOKL
 
 # ────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -48,6 +49,9 @@ parser.add_argument("--exp_name", type=str, required=True)
 parser.add_argument("--seed", type=int, required=True)
 parser.add_argument("--num_envs", default=4, type=int)
 parser.add_argument("--learning_rate", default=3e-5, type=float)
+parser.add_argument("--kl_coef", default=0.0, type=float,
+                    help="KL penalty coefficient (beta) for GRPO+KL ablation; "
+                         ">0 switches --algo grpo to the KL-penalized variant (GRPOKL)")
 parser.add_argument("--max_steps", default=5_000_000, type=int)
 parser.add_argument("--eval_freq", default=100_000, type=int)
 parser.add_argument("--n_eval_episodes", default=10, type=int)
@@ -363,15 +367,25 @@ def main():
     pretrained_model = os.path.join(ARGS.pretrained_path, "best_model.zip")
     pretrained_vecnorm = os.path.join(ARGS.pretrained_path, "best_vecnormalize.pkl")
 
-    algo_cls = {"ppo": PPO, "grpo": GRPO}[ARGS.algo]
-    print(f"Algorithm : {ARGS.algo}")
+    if ARGS.algo == "ppo":
+        algo_cls = PPO
+        load_kwargs = dict(
+            env=env,
+            tensorboard_log=f"runs/baseline_{ARGS.env_name}_{ARGS.exp_name}",
+        )
+    else:  # grpo
+        algo_cls = GRPOKL if ARGS.kl_coef > 0 else GRPO
+        load_kwargs = dict(
+            env=env,
+            tensorboard_log=f"runs/baseline_{ARGS.env_name}_{ARGS.exp_name}",
+        )
+        if algo_cls is GRPOKL:
+            load_kwargs["kl_coef"] = ARGS.kl_coef
+    algo_tag = f"{ARGS.algo}" + ("+kl" if ARGS.algo == "grpo" and ARGS.kl_coef > 0 else "")
+    print(f"Algorithm : {algo_tag}")
     print(f"Pretrained: {pretrained_model}")
 
-    model = algo_cls.load(
-        pretrained_model,
-        env=env,
-        tensorboard_log=f"runs/baseline_{ARGS.env_name}_{ARGS.exp_name}",
-    )
+    model = algo_cls.load(pretrained_model, **load_kwargs)
 
     # Load obs normalization, reset reward stats (raw env has different reward)
     env = VecNormalize.load(pretrained_vecnorm, env.venv)
@@ -384,6 +398,10 @@ def main():
     eval_env.training = False
 
     model.set_env(env)
+
+    # Set random seed on the model so that action sampling and mini-batch
+    # shuffling vary across different --seed runs.
+    model.set_random_seed(ARGS.seed)
 
     # ── Callbacks ──
     eval_callback = PeriodicEvalCallback(

@@ -1,0 +1,121 @@
+\chapter{Methodology} \label{Chap3}
+
+\section{Problem Formulation}
+
+We consider the standard reinforcement learning framework, in which an agent executes actions $a_t \sim \pi_\theta(\cdot \mid s_t)$ in an environment, receives rewards $r_t$, and maximizes the cumulative discounted return $\mathbb{E}[\sum_{t} \gamma^t r_t]$. In the policy fine-tuning scenario, we start from a pretrained policy $\pi_0$ and continue optimization in a target environment whose reward function $\hat{R}$ may differ from the reward function $R$ used during training.
+
+We focus on two reward conditions of practical interest:
+
+\begin{itemize}
+  \item \textbf{Misaligned Reward}: $\hat{R}$ is a weighted sum of multiple components, some of which are not fully aligned with the true success condition. The reward is non-zero at every step, but its magnitude does not necessarily reflect task progress.
+  \item \textbf{Sparse Reward}: during training, $\hat{R}$ provides a binary signal only at trajectory termination, equal to $1$ for success and $0$ otherwise. The reward is fully aligned with the objective, but carries very little information. The two conditions differ only in the training reward; at evaluation time both are evaluated with the original full weighted reward so that returns are comparable across conditions.
+\end{itemize}
+
+\section{Algorithms}
+
+\subsection{PPO (Proximal Policy Optimization)}
+
+PPO estimates advantages using GAE:
+\begin{equation}
+  \hat{A}_t^{\text{GAE}} = \sum_{l=0}^{\infty} (\gamma\lambda)^l \delta_{t+l}, \qquad \delta_t = r_t + \gamma V(s_{t+1}) - V(s_t)
+\end{equation}
+where $\delta_t$ is the TD error and $\lambda$ controls the bias--variance trade-off. The GAE advantage directly depends on the absolute magnitude of the reward: any behaviour that makes $\delta_t > 0$ produces a positive learning signal.
+
+\subsection{GRPO (Group Relative Policy Optimization)}
+
+Following the trajectory-level design of Doorman\cite{xue2026opening}, we use group-relative advantages for humanoid policy fine-tuning. Limited by single-GPU memory, we use $K = 4$ parallel environments, each independently sampling one rollout to form a group, obtaining discounted returns $\{G_1, \ldots, G_K\}$ with group mean $\bar{G} = \frac{1}{K}\sum_k G_k$. The GRPO advantage is:
+\begin{equation}
+  \hat{A}_k^{\text{GRPO}} = \frac{G_k - \bar{G}}{\sigma_G + \epsilon}
+\end{equation}
+where $\sigma_G$ is the standard deviation of within-group returns. This advantage is then fed into PPO's standard clipped objective:
+\begin{equation}
+  \mathcal{L}^{\text{GRPO}} = \mathbb{E}\left[\min\left(\rho_k \hat{A}_k^{\text{GRPO}}, \operatorname{clip}(\rho_k, 1-\epsilon, 1+\epsilon)\hat{A}_k^{\text{GRPO}}\right)\right]
+\end{equation}
+where $\rho_k = \frac{\pi_\theta(a|s)}{\pi_{\text{old}}(a|s)}$ is the importance-sampling ratio. Unlike the original LLM version of GRPO, our implementation does not use the KL penalty term $\beta D_{\text{KL}}(\pi_\theta \parallel \pi_{\text{ref}})$; the trust region is provided solely by PPO's clipping mechanism. In addition, GRPO does not use a value function (critic); the advantage signal is produced entirely by within-group relative comparison, so no absolute value estimate needs to be learned, which also avoids the extra signal noise from value-function estimation error.
+
+The key difference between the two algorithms lies in the source of the advantage signal: PPO's GAE is based on absolute reward values, so any reward increase is encoded as a positive advantage; GRPO's group-relative advantage is based on within-group relative performance, so only behaviour that outperforms other samples in the same group yields a positive advantage.
+
+\section{Experimental Setup}
+
+\subsection{Environment}
+
+\begin{itemize}
+  \item Task: HumanoidBench `h1hand-door-v0`, the H1 humanoid pushing a door open and passing through it.
+  \item Observation: 155-dimensional vector, normalized by VecNormalize before being fed to the policy.
+  \item Action space: 61-dimensional continuous control (diagonal Gaussian policy).
+  \item Maximum steps: 1000 steps/episode.
+  \item Success criterion: the robot's torso x-coordinate $> 0.8$, i.e., crossing the door frame located at $x = 0.8$ m.
+\end{itemize}
+
+The environment uses the MuJoCo physics engine at a control frequency of 50 Hz (frame\_skip = 10). The task is difficult because the robot must coordinate whole-body motion, first approach the door and place its hand on the handle to press it, then push the door open and pass through.
+
+\subsection{Reward Function}
+
+The original Door reward is composed of 6 raw signals forming 5 weighted terms:
+\begin{equation}
+  R = \underbrace{0.1 \cdot R_\text{stand} \cdot R_\text{control}}_{\text{posture}} + \underbrace{0.45 \cdot R_\text{door\_open}}_{\text{door openness}} + \underbrace{0.05 \cdot R_\text{hatch\_open}}_{\text{handle press}} + \underbrace{0.05 \cdot R_\text{hand\_prox}}_{\text{hand--handle distance}} + \underbrace{0.35 \cdot R_\text{passage}}_{\text{passing the door}}
+\end{equation}
+
+Each component is computed as follows:
+\begin{itemize}
+  \item $R_\text{stand}$: equals 1 when the torso height $\geq 1.65$ m and the uprightness $\geq 0.9$, decaying when deviating; range $[0, 1]$.
+  \item $R_\text{control} = (4 + \bar{c})/5$, where $\bar{c}$ is the reward value of the joint-torque interval; smaller torque brings it closer to 1, so $R_\text{control} \in [0.8, 1]$.
+  \item $R_\text{door\_open} = \min(1, q_d \cdot |q_d|)$, where $q_d$ is the door joint angle (rad); for a positive opening it degenerates to $\min(1, q_d^2)$, saturating at 1 when $q_d = 1$ rad, and the door can be pushed or pulled every step to produce a non-zero signal.
+  \item $R_\text{hatch\_open}$: equals 1 when the handle joint angle lies within $[0.75, 2]$ rad.
+  \item $R_\text{hand\_prox}$: equals 1 when the minimum distance of the two hands to the handle is $\leq 0.25$ m.
+  \item $R_\text{passage}$: equals 1 when the torso (imu site) x-coordinate $\geq 1.2$ m, rising linearly as $x$ goes from 0.2 to 1.2 m, and 0 when $x \leq 0.2$ m.
+\end{itemize}
+
+\subsection{Baseline Model}
+
+The baseline model is obtained by pretraining PPO on the Door task with curriculum learning. The curriculum consists of four stages that gradually increase task difficulty, using the full dense reward during training. The baseline performance is:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lc}
+\hline
+Metric & Value \\
+\hline
+Success rate & 5.0\% \\
+Mean return & 244.0 \\
+\hline
+\end{tabular}
+\caption{Baseline model performance.}
+\label{tab:baseline}
+\end{table}
+
+The baseline is a single pretrained model; the values are the mean over its 100 evaluation episodes, with no cross-seed statistics. Although the baseline success rate is low, it already has basic structural understanding of the task, which makes it a suitable common starting point for comparing the stability of the two fine-tuning strategies.
+
+\subsection{Training and Evaluation Settings}
+
+The two reward conditions simulate different challenges of reward design in real RL fine-tuning; their definitions are given in Section~\ref{sec:formulation}, and the training rewards and corresponding model names are:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{llll}
+\hline
+Condition & Training reward & PPO model & GRPO model \\
+\hline
+Misaligned Reward & Original dense reward (5 terms) & PPO (Misaligned) & GRPO (Misaligned) \\
+Sparse Reward & Binary reward (Success=1, else 0) & PPO (Sparse) & GRPO (Sparse) \\
+\hline
+\end{tabular}
+\caption{Training rewards and model naming.}
+\label{tab:conditions}
+\end{table}
+
+All models are initialized from the baseline weights with a learning rate of $3\times10^{-5}$, 4 parallel environments, and 5M training steps. The model selection criterion is to choose, among the periodic evaluations during training, the checkpoint with the highest mean reward under the Misaligned condition and the highest mean reward under the Sparse condition, respectively. All experiments are repeated over 3 independent training seeds (42, 98, 5075) to verify statistical robustness.
+
+Evaluation uses 5 independent seeds (1024, 2024, 777, 88, 13), each running 20 episodes, for a total of 100 episodes per model. All inference uses a deterministic policy (`deterministic=True`). The main evaluation metrics are the success rate and the episode return.
+
+\subsection{Evaluation and Analysis Protocol}
+
+\textbf{Evaluation metrics.} The success rate is defined as the proportion of the 100 evaluation episodes in which the robot successfully passes through the door frame; the success criterion is given in Section~\ref{sec:env}. The episode return is the cumulative weighted reward of a single episode.
+
+\textbf{Reward decomposition.} We capture each reward component in the `info` dict of each step in the environment wrapper and output the accumulated value of each component at episode termination. For the posture-maintenance component ($0.1 \cdot R_\text{stand} \cdot R_\text{control}$), since $\sum (a_t \cdot b_t) \neq (\sum a_t) \cdot (\sum b_t)$, we accumulate the products step by step rather than summing over the episode and then multiplying.
+
+\textbf{KL divergence and policy analysis.} We collect 1000 raw observations by rolling out the baseline policy in the environment. For each fine-tuned model, we normalize the observations with its own VecNormalize statistics and then extract the action-distribution parameters $(\mu, \log\sigma)$. For two $d$-dimensional diagonal Gaussian distributions $P$ and $Q$, the closed-form KL divergence is:
+\begin{equation}
+  D_{\text{KL}}(P \parallel Q) = \sum_{i=1}^{d} \left[ \log\frac{\sigma_{Q,i}}{\sigma_{P,i}} + \frac{\sigma_{P,i}^2 + (\mu_{P,i} - \mu_{Q,i})^2}{2\sigma_{Q,i}^2} - \frac{1}{2} \right]
+\end{equation}
+We compute $D_{\text{KL}}(\pi_\text{finetuned} \parallel \pi_\text{baseline})$ at each observation and report its mean, median, standard deviation and quantiles. The parameter-space distance is computed directly on the model weights as the per-layer L2 norm $||\theta_\text{finetuned} - \theta_\text{baseline}||_2$.

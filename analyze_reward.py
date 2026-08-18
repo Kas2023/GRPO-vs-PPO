@@ -37,13 +37,13 @@ Usage:
         --n_episodes 50
 
     # All four models at once + CSV export
-    python analyze_reward.py \
-        --baseline_exp curriculum-v7.1 \
-        --ppo_exp ft_ppo_v2 --ppo_model best_model \
-        --grpo_exp ft_grpo_v2 --grpo_model best_model \
-        --ppo2_exp ft_ppo_v3 --ppo2_model best_by_reward \
-        --grpo2_exp ft_grpo_v3 --grpo2_model best_by_reward \
-        --phase2 --csv reward_decomp.csv
+python analyze_reward.py \
+    --baseline_exp curriculum-v7.1 \
+    --ppo_exp ft_ppo_v2_98 --ppo_model best_by_reward \
+    --grpo_exp ft_grpokl_98 --grpo_model best_by_reward \
+    --ppo2_exp ft_ppo_v3_98 --ppo2_model best_by_reward \
+    --grpo2_exp ft_grpokl_2_98 --grpo2_model best_by_reward \
+    --phase2 --csv results/reward_decomp_kl_98.csv
 """
 
 import argparse
@@ -54,7 +54,6 @@ from collections import defaultdict
 
 import numpy as np
 import gymnasium as gym
-from gymnasium.wrappers import TimeLimit
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
@@ -84,6 +83,19 @@ COMPONENT_WEIGHTS = {
     "passage_reward": 0.35,
 }
 
+# Additive terms of the env reward. small_control is NOT here: it is only a
+# multiplicative factor inside the stand term (0.1 * stand_reward * small_control),
+# already accounted for by the "stand_reward" row via ep["stand_weighted"].
+# Listing it as its own weighted contribution would double-count it and push
+# the fraction rows past 100%.
+WEIGHTED_TERMS = [
+    "stand_reward",
+    "door_openness_reward",
+    "door_hatch_openness_reward",
+    "hand_hatch_proximity_reward",
+    "passage_reward",
+]
+
 # Note: In the env, stand_reward is weighted as 0.1 * stand_reward * small_control,
 # not 0.1 * stand_reward + 0.1 * small_control. We report the raw components
 # and compute the weighted total ourselves for verification.
@@ -111,6 +123,9 @@ class RewardDecompWrapper(gym.Wrapper):
         self._prev_action = None
         self._episode_action_sqdiff = 0.0
         self._component_accum = {c: 0.0 for c in REWARD_COMPONENTS}
+        # stand term is 0.1 * stand_reward_t * small_control_t summed PER STEP —
+        # it cannot be reconstructed from the per-episode sums (Σ(a·b) ≠ Σa·Σb).
+        self._stand_weighted_accum = 0.0
         self._total_reward = 0.0
         self._n_steps = 0
 
@@ -126,6 +141,7 @@ class RewardDecompWrapper(gym.Wrapper):
         self._prev_action = None
         self._episode_action_sqdiff = 0.0
         self._component_accum = {c: 0.0 for c in REWARD_COMPONENTS}
+        self._stand_weighted_accum = 0.0
         self._total_reward = 0.0
         self._n_steps = 0
         return obs, info
@@ -139,6 +155,11 @@ class RewardDecompWrapper(gym.Wrapper):
         for c in REWARD_COMPONENTS:
             if c in info:
                 self._component_accum[c] += float(info[c])
+        # stand term must be accumulated as the per-step PRODUCT
+        self._stand_weighted_accum += (
+            0.1 * float(info.get("stand_reward", 0.0))
+            * float(info.get("small_control", 0.0))
+        )
         self._total_reward += float(reward)
 
         # Success: robot torso past door frame (same criterion as EvalMetricsWrapper)
@@ -154,6 +175,7 @@ class RewardDecompWrapper(gym.Wrapper):
 
         if terminated or truncated:
             info["_reward_components"] = dict(self._component_accum)
+            info["_stand_weighted"] = self._stand_weighted_accum
             info["_total_reward_accum"] = self._total_reward
             info["_n_steps"] = self._n_steps
             if self._episode_success:
@@ -170,7 +192,10 @@ class RewardDecompWrapper(gym.Wrapper):
 def make_env(env_name: str = "h1hand-door-v0"):
     def _init():
         env = gym.make(env_name)
-        env = TimeLimit(env, max_episode_steps=1000)
+        # gym.make already applies TimeLimit(max_episode_steps=1000) at
+        # registration (see humanoid_bench/env.py). Do NOT add a second
+        # TimeLimit — a nested one shifts the truncation step and makes
+        # episode returns drift by a step vs eval.py's wrapper stack.
         env = RewardDecompWrapper(env)
         return env
     return _init
@@ -196,13 +221,19 @@ def eval_model(
     """
 
     env = DummyVecEnv([make_env(env_name)])
-    env = VecNormalize(env, norm_obs=True, norm_reward=False,
-                       clip_obs=10.0, training=False)
 
+    # Load VecNormalize onto the RAW DummyVecEnv (single wrapper) — same as
+    # eval.py. Wrapping a fresh VecNormalize first and then loading on top of
+    # it double-normalizes: the inner fresh layer clips raw obs to ±clip_obs
+    # (in raw units) BEFORE the real stats are applied, corrupting any obs
+    # component whose magnitude exceeds clip_obs (e.g. joint velocities).
     if vecnormalize_path and os.path.exists(vecnormalize_path):
         env = VecNormalize.load(vecnormalize_path, env)
         env.training = False
         env.norm_reward = False
+    else:
+        env = VecNormalize(env, norm_obs=True, norm_reward=False,
+                           clip_obs=10.0, training=False)
 
     model.set_env(env)
 
@@ -229,6 +260,7 @@ def eval_model(
 
         per_episode.append({
             "components": components,
+            "stand_weighted": env_info.get("_stand_weighted", 0.0),
             "total_reward": total_reward,
             "success": ep_success,
             "n_steps": env_info.get("_n_steps", 0),
@@ -259,7 +291,7 @@ def eval_model(
     for ep in per_episode:
         c = ep["components"]
         w = (
-            0.1 * c.get("stand_reward", 0) * c.get("small_control", 0)
+            ep["stand_weighted"]  # already 0.1 * Σ(stand_t · small_control_t)
             + 0.45 * c.get("door_openness_reward", 0)
             + 0.05 * c.get("door_hatch_openness_reward", 0)
             + 0.05 * c.get("hand_hatch_proximity_reward", 0)
@@ -344,7 +376,7 @@ def print_comparison(results: dict):
     print("WEIGHTED CONTRIBUTIONS (component × weight, per-episode):")
     print("-" * 90)
 
-    for comp in REWARD_COMPONENTS:
+    for comp in WEIGHTED_TERMS:
         weight = COMPONENT_WEIGHTS[comp]
         label = f"  {comp}"
         print(f"\n{label:<30}", end="")
@@ -358,12 +390,12 @@ def print_comparison(results: dict):
                 for ep in results[name]["per_episode"]
             ]
             if comp == "stand_reward":
-                # stand_reward is multiplied by small_control in the env
-                small_vals = [
-                    ep["components"].get("small_control", 0.0)
+                # stand_reward is multiplied by small_control PER STEP in the env,
+                # so use the per-step accumulated product, not Σstand · Σsmall.
+                weighted = [
+                    ep["stand_weighted"]
                     for ep in results[name]["per_episode"]
                 ]
-                weighted = [0.1 * s * c for s, c in zip(small_vals, raw_vals)]
             else:
                 weighted = [weight * v for v in raw_vals]
             print(f" | {np.mean(weighted):>7.3f} ± {np.std(weighted):<7.3f}", end="")
@@ -374,7 +406,7 @@ def print_comparison(results: dict):
     print("FRACTION OF COMPUTED WEIGHTED REWARD (%):")
     print("-" * 90)
 
-    for comp in REWARD_COMPONENTS:
+    for comp in WEIGHTED_TERMS:
         weight = COMPONENT_WEIGHTS[comp]
         print(f"  {comp:<35}", end="")
 
@@ -384,17 +416,16 @@ def print_comparison(results: dict):
                 for ep in results[name]["per_episode"]
             ]
             if comp == "stand_reward":
-                small_vals = [
-                    ep["components"].get("small_control", 0.0)
+                weighted_comp = np.array([
+                    ep["stand_weighted"]
                     for ep in results[name]["per_episode"]
-                ]
-                weighted_comp = np.array([0.1 * s * c for s, c in zip(small_vals, raw_vals)])
+                ])
             else:
                 weighted_comp = np.array(raw_vals) * weight
 
             total_weighted = np.array([
                 (
-                    0.1 * ep["components"].get("stand_reward", 0) * ep["components"].get("small_control", 0)
+                    ep["stand_weighted"]
                     + 0.45 * ep["components"].get("door_openness_reward", 0)
                     + 0.05 * ep["components"].get("door_hatch_openness_reward", 0)
                     + 0.05 * ep["components"].get("hand_hatch_proximity_reward", 0)
@@ -429,6 +460,7 @@ def export_csv(results: dict, csv_path: str):
                 "episode": i,
                 "success": int(ep["success"]),
                 "total_reward": ep["total_reward"],
+                "stand_weighted": ep.get("stand_weighted", 0.0),
                 "n_steps": ep["n_steps"],
             }
             for c in REWARD_COMPONENTS:
@@ -632,7 +664,7 @@ def main():
         for ep in all_per_ep:
             c = ep["components"]
             w = (
-                0.1 * c.get("stand_reward", 0) * c.get("small_control", 0)
+                ep["stand_weighted"]  # already 0.1 * Σ(stand_t · small_control_t)
                 + 0.45 * c.get("door_openness_reward", 0)
                 + 0.05 * c.get("door_hatch_openness_reward", 0)
                 + 0.05 * c.get("hand_hatch_proximity_reward", 0)

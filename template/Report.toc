@@ -1,0 +1,39 @@
+\babel@toc {english}{}\relax 
+\contentsline {chapter}{List of Figures}{viii}{chapter*.4}%
+\contentsline {chapter}{List of Tables}{ix}{chapter*.5}%
+\contentsline {chapter}{\numberline {1}Project Plan}{xii}{chapter.1}%
+\contentsline {chapter}{\numberline {2}Introduction and Background}{1}{chapter.2}%
+\contentsline {section}{\numberline {2.1}Introduction}{1}{section.2.1}%
+\contentsline {section}{\numberline {2.2}Related Work}{3}{section.2.2}%
+\contentsline {subsection}{\numberline {2.2.1}Misaligned Rewards and Reward Hacking}{3}{subsection.2.2.1}%
+\contentsline {subsection}{\numberline {2.2.2}Sparse Rewards and Long-Horizon Tasks}{4}{subsection.2.2.2}%
+\contentsline {subsection}{\numberline {2.2.3}Pretraining--Fine-Tuning and Robot RL Post-Training}{5}{subsection.2.2.3}%
+\contentsline {subsection}{\numberline {2.2.4}GRPO and Its Behaviour under Unreliable Rewards}{5}{subsection.2.2.4}%
+\contentsline {chapter}{\numberline {3}Methodology}{7}{chapter.3}%
+\contentsline {section}{\numberline {3.1}Problem Formulation}{7}{section.3.1}%
+\contentsline {section}{\numberline {3.2}Algorithms}{7}{section.3.2}%
+\contentsline {subsection}{\numberline {3.2.1}PPO (Proximal Policy Optimization)}{7}{subsection.3.2.1}%
+\contentsline {subsection}{\numberline {3.2.2}GRPO (Group Relative Policy Optimization)}{8}{subsection.3.2.2}%
+\contentsline {section}{\numberline {3.3}Experimental Setup}{9}{section.3.3}%
+\contentsline {subsection}{\numberline {3.3.1}Environment}{9}{subsection.3.3.1}%
+\contentsline {subsection}{\numberline {3.3.2}Reward Function}{9}{subsection.3.3.2}%
+\contentsline {subsection}{\numberline {3.3.3}Baseline Model}{10}{subsection.3.3.3}%
+\contentsline {subsection}{\numberline {3.3.4}Training and Evaluation Settings}{11}{subsection.3.3.4}%
+\contentsline {subsection}{\numberline {3.3.5}Evaluation and Analysis Protocol}{11}{subsection.3.3.5}%
+\contentsline {chapter}{\numberline {4}Results and Analysis}{13}{chapter.4}%
+\contentsline {section}{\numberline {4.1}Main Results: Overall Performance under Two Reward Conditions}{13}{section.4.1}%
+\contentsline {section}{\numberline {4.2}Diagnostic Analysis}{15}{section.4.2}%
+\contentsline {subsection}{\numberline {4.2.1}Reward Decomposition}{15}{subsection.4.2.1}%
+\contentsline {subsection}{\numberline {4.2.2}KL Divergence and Policy-Update Magnitude}{17}{subsection.4.2.2}%
+\contentsline {subsection}{\numberline {4.2.3}Parameter-Space Distance}{21}{subsection.4.2.3}%
+\contentsline {subsection}{\numberline {4.2.4}VecNormalize Drift}{21}{subsection.4.2.4}%
+\contentsline {subsection}{\numberline {4.2.5}Summary}{22}{subsection.4.2.5}%
+\contentsline {section}{\numberline {4.3}Ablation Study: The Role of the KL Penalty}{23}{section.4.3}%
+\contentsline {section}{\numberline {4.4}Cross-Task Validation: The Reach Task}{24}{section.4.4}%
+\contentsline {chapter}{\numberline {5}Discussion}{26}{chapter.5}%
+\contentsline {section}{\numberline {5.1}A Possible Mechanistic Explanation of GRPO's Robustness}{26}{section.5.1}%
+\contentsline {section}{\numberline {5.2}Limitations}{27}{section.5.2}%
+\contentsline {chapter}{\numberline {6}Conclusion}{29}{chapter.6}%
+\contentsline {chapter}{References}{31}{chapter*.24}%
+\contentsline {chapter}{Appendix \numberline {A}Source Code}{35}{appendix.1.A}%
+\contentsline {chapter}{Appendix \numberline {B}Project Introduction Video}{36}{appendix.1.B}%
