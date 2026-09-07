@@ -11,7 +11,10 @@ logs/
 wandb/
 runs/
 videos/
-# docs/
+docs/
+slides/
+results/
+template/
 
 # 模型文件
 models/

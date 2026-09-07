@@ -18,18 +18,18 @@ Metrics:
 
 Usage:
     # Evaluate a finetune_reach model (expanded mode)
-    python eval_reach.py \\
-        --exp_name reach_sparse_grpo \\
-        --model_file best_by_success.zip \\
-        --vecnormalize_file best_by_success_vecnormalize.pkl \\
-        --algo grpo \\
-        --seeds 42 1024 2024 777 88 13
+    python eval_reach.py \
+        --exp_name reach_sparse_ppo_5075 \
+        --model_file best_by_success.zip \
+        --vecnormalize_file best_by_success_vecnormalize.pkl \
+        --algo ppo \
+        --seeds 1024 2024 777 88 13
 
     # Evaluate baseline with expanded architecture
-    python eval_reach.py \\
-        --exp_name baseline_expanded \\
-        --baseline \\
-        --seeds 42 1024 2024 777 88 13
+    python eval_reach.py \
+        --exp_name baseline_expanded \
+        --baseline \
+        --seeds 1024 2024 777 88 13
 
     # Evaluate baseline with original wrappers (55D/19D)
     python eval_reach.py \\

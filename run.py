@@ -22,8 +22,6 @@ import torch as th
 from collections import deque
 
 from utils.wrappers import DoorCurriculumWrapper, ActionSmoothnessWrapper, ControlCostWrapper
-from utils.inverted_curriculum import InvertedDoorCurriculumWrapper
-from utils.door_freeze_curriculum import DoorFreezeCurriculumWrapper
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--env_name", type=str)
@@ -35,14 +33,6 @@ parser.add_argument("--max_steps", default=20000000, type=int)
 parser.add_argument("--eval_freq", default=100000, type=int)
 parser.add_argument("--n_eval_episodes", default=10, type=int)
 parser.add_argument("--load_pretrained", action="store_true")
-parser.add_argument("--inverted", action="store_true",
-                    help="Use inverted curriculum (InvertedDoorCurriculumWrapper) instead of forward curriculum")
-parser.add_argument("--initial_tau", type=float, default=0.0,
-                    help="Initial tau for inverted curriculum (0=easy, 1=full task)")
-parser.add_argument("--freeze_curriculum", action="store_true",
-                    help="Use door freeze curriculum (DoorFreezeCurriculumWrapper) instead of forward curriculum")
-parser.add_argument("--initial_stage", type=int, default=0,
-                    help="Initial stage for freeze curriculum (0-4)")
 parser.add_argument("--wandb_entity", default="wlx-k-s-2003-ucl", type=str)
 ARGS = parser.parse_args()
 
@@ -60,14 +50,7 @@ def make_env(
     def _init():
 
         env = gym.make(ARGS.env_name)
-        # env = ControlCostWrapper(env, penalty_coef=0.02, force_margin=5.0)
-        # env = ActionSmoothnessWrapper(env, penalty_coef=0.001)
-        if ARGS.freeze_curriculum:
-            env = DoorFreezeCurriculumWrapper(env, stage=ARGS.initial_stage)
-        elif ARGS.inverted:
-            env = InvertedDoorCurriculumWrapper(env, initial_tau=ARGS.initial_tau)
-        else:
-            env = DoorCurriculumWrapper(env, stage=1)
+        env = DoorCurriculumWrapper(env, stage=1)
         env = TimeLimit(env, max_episode_steps=1000)
         env = Monitor(env, f"logs/{ARGS.env_name}/{ARGS.exp_name}/train/env_{rank}")
         env.reset(seed=ARGS.seed + rank)
@@ -283,18 +266,6 @@ class CurriculumLogCallback(BaseCallback):
                     "curriculum/distance_from_door": np.mean(self.episode_metrics["distance_from_door"]),
                     "curriculum/hand_hooking_rate": np.mean(self.episode_metrics["hand_hooking"]),
                 }
-                # 逆向课程：额外记录 tau 和滑窗成功率
-                if "inverted_tau" in info:
-                    log_dict["curriculum/inverted_tau"] = info["inverted_tau"]
-                if "inverted_success_rate" in info:
-                    log_dict["curriculum/inverted_success_rate"] = info["inverted_success_rate"]
-                # 冻结课程：额外记录 stage 和滑窗成功率
-                if "freeze_stage" in info:
-                    log_dict["curriculum/freeze_stage"] = info["freeze_stage"]
-                if "freeze_success_rate" in info:
-                    log_dict["curriculum/freeze_success_rate"] = info["freeze_success_rate"]
-                if "freeze_triggered" in info:
-                    log_dict["curriculum/freeze_triggered"] = info["freeze_triggered"]
                 wandb.log(log_dict)
                 # 清空缓存
                 self.episode_metrics = {k: [] for k in self.episode_metrics}
@@ -354,17 +325,8 @@ def main(argv):
         eval_env.ret_rms = env.ret_rms
         eval_env.training  = False
 
-        if ARGS.freeze_curriculum:
-            # 冻结课程模式：训练环境用指定的 stage，评估环境用 stage=4（完整任务）
-            env.env_method("set_stage", ARGS.initial_stage)
-            eval_env.env_method("set_stage", 4)
-        elif ARGS.inverted:
-            # 逆向课程模式：训练环境用指定的 tau，评估环境用 tau=1.0（完整任务）
-            env.env_method("set_tau", ARGS.initial_tau)
-            eval_env.env_method("set_tau", 1.0)
-        else:
-            env.env_method("set_stage", 4)
-            eval_env.env_method("set_stage", 4)
+        env.env_method("set_stage", 4)
+        eval_env.env_method("set_stage", 4)
         model.set_env(env)
 
     best_model_callback = CustomEvalCallback(
